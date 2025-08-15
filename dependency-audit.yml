@@ -1,0 +1,147 @@
+name: Dependency Audit & Upgrade Check
+
+on:
+  pull_request:
+    branches: [ '*' ]
+  workflow_dispatch:
+  
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  audit-and-check-upgrades:
+    runs-on: ubuntu-latest
+    
+    defaults:
+      run:
+        working-directory: ./backend
+
+    permissions:
+      pull-requests: write
+    
+    steps:
+      - name: 1. Checkout repository code
+        uses: actions/checkout@v4
+
+      - name: 2. Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: backend/dev-requirements.txt
+
+      - name: 3. Install core tools
+        run: pip install pip-tools pip-audit
+
+      - name: 4. Audit Current Production Dependencies
+        id: audit_current_prod
+        run: |
+          echo "AUDIT_CURRENT_PROD<<EOF" >> $GITHUB_ENV
+          pip-audit -r requirements.txt >> $GITHUB_ENV || true
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: 5. Audit Current Development Dependencies
+        id: audit_current_dev
+        run: |
+          echo "AUDIT_CURRENT_DEV<<EOF" >> $GITHUB_ENV
+          pip-audit -r dev-requirements.txt >> $GITHUB_ENV || true
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: 6. Simulate a Full Upgrade
+        run: |
+          echo "Simulating production upgrade..."
+          pip-compile --upgrade --quiet -o upgraded-requirements.txt
+          
+          echo "Simulating development upgrade..."
+          pip-compile --upgrade --quiet --extra dev -o upgraded-dev-requirements.txt
+
+      - name: 7. Audit Upgraded Production Dependencies
+        id: audit_upgraded_prod
+        run: |
+          echo "AUDIT_UPGRADED_PROD<<EOF" >> $GITHUB_ENV
+          pip-audit -r upgraded-requirements.txt >> $GITHUB_ENV || true
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: 8. Audit Upgraded Development Dependencies
+        id: audit_upgraded_dev
+        run: |
+          echo "AUDIT_UPGRADED_DEV<<EOF" >> $GITHUB_ENV
+          pip-audit -r upgraded-dev-requirements.txt >> $GITHUB_ENV || true
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: 9. Generate Upgrade Diff
+        id: generate_diff
+        run: |
+          echo "DIFF_CONTENT<<EOF" >> $GITHUB_ENV
+          diff -u requirements.txt upgraded-requirements.txt >> $GITHUB_ENV || true
+          diff -u dev-requirements.txt upgraded-dev-requirements.txt >> $GITHUB_ENV || true
+          echo "EOF" >> $GITHUB_ENV
+          
+      - name: 10. Assemble the Full Report
+        id: assemble_report
+        run: |
+          {
+            echo '### Dependency Analysis Report'
+            echo ''
+            echo '**A report on the current state and potential upgrades for my project dependencies.**'
+            echo ''
+            echo '<details><summary><strong>Current Vulnerabilities</strong> Prod</summary>'
+            echo ''
+            echo '#### Production (`requirements.txt`)'
+            echo '```'
+            if [[ -z "${{ env.AUDIT_CURRENT_PROD }}" || "${{ env.AUDIT_CURRENT_PROD }}" == "No vulnerabilities found"* ]]; then
+              echo "No vulnerabilities found."
+            else
+              echo "${{ env.AUDIT_CURRENT_PROD }}"
+            fi
+            echo '```'
+            echo ''
+            echo '#### Development (`dev-requirements.txt`)'
+            echo '```'
+            if [[ -z "${{ env.AUDIT_CURRENT_DEV }}" || "${{ env.AUDIT_CURRENT_DEV }}" == "No vulnerabilities found"* ]]; then
+              echo "No vulnerabilities found."
+            else
+              echo "${{ env.AUDIT_CURRENT_DEV }}"
+            fi
+            echo '```'
+            echo '</details>'
+            echo ''
+            echo '<details><summary><strong>Upgrade Simulation Results</strong></summary>'
+            echo ''
+            echo '#### Proposed Changes (`diff`)'
+            echo '```diff'
+            if [[ -z "${{ env.DIFF_CONTENT }}" ]]; then
+              echo "Lock files are already fully upgraded."
+            else
+              echo "${{ env.DIFF_CONTENT }}"
+            fi
+            echo '```'
+            echo ''
+            echo '#### Vulnerabilities After Upgrade'
+            echo '```'
+            if [[ -z "${{ env.AUDIT_UPGRADED_PROD }}" || "${{ env.AUDIT_UPGRADED_PROD }}" == "No vulnerabilities found"* ]]; then
+              echo "No vulnerabilities found in upgraded packages."
+            else
+              echo "${{ env.AUDIT_UPGRADED_PROD }}"
+            fi
+            echo '```'
+            echo '</details>'
+            echo ''
+            echo '---'
+            echo '<!-- dependency-audit-comment-marker -->'
+          } >> report.md
+        env:
+          AUDIT_CURRENT_PROD: ${{ env.AUDIT_CURRENT_PROD }}
+          AUDIT_CURRENT_DEV: ${{ env.AUDIT_CURRENT_DEV }}
+          AUDIT_UPGRADED_PROD: ${{ env.AUDIT_UPGRADED_PROD }}
+          AUDIT_UPGRADED_DEV: ${{ env.AUDIT_UPGRADED_DEV }}
+          DIFF_CONTENT: ${{ env.DIFF_CONTENT }}
+
+      - name: 11. Post or Update Comment on Pull Request
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: backend/report.md
+          comment-marker: dependency-audit-comment-marker
